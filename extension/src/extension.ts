@@ -1,10 +1,14 @@
 /**
- * Claude Code Workspace Bridge — VS Code Extension v0.10.0
+ * Claude Code Workspace Bridge — VS Code Extension v0.11.0
  *
  * On activation:
- *   1. Starts a local HTTP server exposing VS Code workspace intelligence.
- *   2. Syncs the bundled MCP server to a stable path (~/.claude-code-workspace/).
- *   3. Auto-configures ~/.claude.json so Claude Code picks it up immediately.
+ *   1. Starts a local HTTP server exposing VS Code workspace intelligence (ephemeral port).
+ *   2. Writes a registry entry to ~/.claude-code-workspace/bridges/<pid>.json.
+ *   3. Syncs the bundled MCP server to a stable path (~/.claude-code-workspace/).
+ *   4. Auto-configures ~/.claude.json so Claude Code picks it up immediately.
+ *
+ * Multi-window: each VS Code window binds an ephemeral port and registers itself.
+ * The MCP server routes per-request by matching file paths to workspaceFolders.
  *
  * Endpoints:
  *   /health, /symbols, /document-symbols, /hover, /files, /active-editor,
@@ -25,7 +29,7 @@ import * as vscode from 'vscode';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const VERSION = '0.10.0';
+const VERSION = '0.11.0';
 const EXT_NAME = 'Claude Code Workspace';
 const MCP_KEY = 'vscode-workspace';
 /** Stable directory written outside the extension so the path survives updates. */
@@ -33,6 +37,10 @@ const STABLE_DIR = path.join(os.homedir(), '.claude-code-workspace');
 const STABLE_SERVER = path.join(STABLE_DIR, 'mcp-server.mjs');
 const SECRET_FILE = path.join(STABLE_DIR, 'secret');
 const CLAUDE_JSON = path.join(os.homedir(), '.claude.json');
+
+/** Registry directory — each VS Code window writes <pid>.json here. */
+const BRIDGES_DIR = path.join(STABLE_DIR, 'bridges');
+const REGISTRY_FILE = path.join(BRIDGES_DIR, `${process.pid}.json`);
 
 // ─── Output channel ───────────────────────────────────────────────────────────
 
@@ -45,10 +53,6 @@ function log(line: string): void {
 
 function cfg<T>(key: string): T {
   return vscode.workspace.getConfiguration('claudeCodeWorkspace').get<T>(key) as T;
-}
-
-function getPort(): number {
-  return cfg<number>('port') || 29837;
 }
 
 function resolveClaude(): string | null {
@@ -91,13 +95,14 @@ async function writeClaudeJson(config: ClaudeConfig): Promise<void> {
   await fs.promises.writeFile(CLAUDE_JSON, JSON.stringify(config, null, 2) + '\n', 'utf8');
 }
 
-function isAlreadyConfigured(config: ClaudeConfig, port: number, secret: string): boolean {
+function isAlreadyConfigured(config: ClaudeConfig, secret: string): boolean {
   const entry = config.mcpServers?.[MCP_KEY];
   if (!entry) return false;
   const argPath = entry.args?.[0];
-  const portMatch = entry.env?.['VSCODE_BRIDGE_PORT'] === String(port);
   const tokenMatch = entry.env?.['VSCODE_BRIDGE_TOKEN'] === secret;
-  return argPath === STABLE_SERVER && portMatch && tokenMatch;
+  // If VSCODE_BRIDGE_PORT is still set, treat as old config so first-run re-fires to upgrade.
+  if (entry.env?.['VSCODE_BRIDGE_PORT']) return false;
+  return argPath === STABLE_SERVER && tokenMatch;
 }
 
 // ─── Secret helpers ───────────────────────────────────────────────────────────
@@ -113,6 +118,24 @@ async function readOrCreateSecret(): Promise<string> {
   return token;
 }
 
+// ─── Registry helpers ──────────────────────────────────────────────────────────
+
+async function writeRegistry(port: number): Promise<void> {
+  await fs.promises.mkdir(BRIDGES_DIR, { recursive: true });
+  const entry = {
+    pid: process.pid,
+    port,
+    workspaceFolders: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
+    startedAt: new Date().toISOString(),
+  };
+  await fs.promises.writeFile(REGISTRY_FILE, JSON.stringify(entry, null, 2), { mode: 0o600 });
+  log(`Registry written: port=${port} pid=${process.pid} folders=${entry.workspaceFolders.join(',')}`);
+}
+
+function removeRegistry(): void {
+  try { fs.unlinkSync(REGISTRY_FILE); } catch { /* ignore */ }
+}
+
 // ─── MCP server sync ──────────────────────────────────────────────────────────
 
 async function syncMcpServer(context: vscode.ExtensionContext): Promise<void> {
@@ -123,13 +146,13 @@ async function syncMcpServer(context: vscode.ExtensionContext): Promise<void> {
 
 // ─── Configure / unconfigure ──────────────────────────────────────────────────
 
-async function configureClaude(port: number): Promise<void> {
+async function configureClaude(): Promise<void> {
   const config = await readClaudeJson();
   config.mcpServers = config.mcpServers ?? {};
   config.mcpServers[MCP_KEY] = {
     command: 'node',
     args: [STABLE_SERVER],
-    env: { VSCODE_BRIDGE_PORT: String(port), VSCODE_BRIDGE_TOKEN: bridgeSecret! },
+    env: { VSCODE_BRIDGE_TOKEN: bridgeSecret! },
   };
   await writeClaudeJson(config);
 }
@@ -180,7 +203,8 @@ function flattenDocSymbols(symbols: vscode.DocumentSymbol[], depth = 0): object[
 }
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://127.0.0.1:${getPort()}`);
+  const actualPort = (bridgeServer?.address() as { port?: number } | null)?.port ?? 0;
+  const url = new URL(req.url ?? '/', `http://127.0.0.1:${actualPort}`);
 
   const authz = req.headers['authorization'];
   if (authz !== `Bearer ${bridgeSecret}`) {
@@ -993,20 +1017,27 @@ function setStatus(text: string, tooltip: string, isError = false): void {
 }
 
 function startBridgeServer(context: vscode.ExtensionContext): void {
-  const port = getPort();
   bridgeServer = http.createServer((req, res) => {
     handleRequest(req, res).catch(e => {
       if (!res.headersSent) { res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' })); }
       console.error('[Claude Code Workspace]', e);
     });
   });
-  bridgeServer.listen(port, '127.0.0.1', () => {
-    setStatus('$(plug) Claude Bridge', `Claude Code Workspace bridge active on port ${port}`);
+  // Bind to ephemeral port — kernel assigns a free port; no EADDRINUSE with multiple windows.
+  bridgeServer.listen(0, '127.0.0.1', async () => {
+    const addr = bridgeServer?.address();
+    const actualPort = typeof addr === 'object' && addr ? (addr as { port: number }).port : 0;
+    setStatus('$(plug) Claude Bridge', `Claude Code Workspace bridge active on port ${actualPort} (pid ${process.pid})`);
+    log(`Bridge listening on port ${actualPort}`);
+    // Write registry entry so MCP server can discover us
+    try {
+      await writeRegistry(actualPort);
+    } catch (e) {
+      log(`! Failed to write registry: ${String(e)}`);
+    }
   });
   bridgeServer.on('error', (err: NodeJS.ErrnoException) => {
-    const msg = err.code === 'EADDRINUSE'
-      ? `Port ${port} already in use — another instance may be running, or change the port in Settings.`
-      : `Bridge error: ${err.message}`;
+    const msg = `Bridge error: ${err.message}`;
     setStatus('$(warning) Claude Bridge', msg, true);
     vscode.window.showWarningMessage(`${EXT_NAME}: ${msg}`);
   });
@@ -1022,7 +1053,7 @@ async function promptSetup(): Promise<void> {
   );
   if (choice !== 'Set Up') return;
 
-  await configureClaude(getPort());
+  await configureClaude();
   const restart = await vscode.window.showInformationMessage(
     `${EXT_NAME}: All set! Restart Claude Code to activate the workspace bridge.`,
     'OK'
@@ -1062,7 +1093,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return;
   }
 
-  // Start HTTP bridge
+  // Start HTTP bridge (ephemeral port; registry written in listen callback)
   startBridgeServer(context);
 
   // Register chat participant
@@ -1071,7 +1102,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Commands
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeWorkspace.configure', async () => {
-      await configureClaude(getPort());
+      await configureClaude();
       vscode.window.showInformationMessage(`${EXT_NAME}: Claude Code configured. Restart Claude Code to apply.`);
     }),
     vscode.commands.registerCommand('claudeCodeWorkspace.unconfigure', async () => {
@@ -1080,25 +1111,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
-  // Restart bridge when port changes; re-configure claude.json with new port
+  // Re-write registry when workspace folders change (e.g. user opens a new folder)
   context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration(async e => {
-      if (e.affectsConfiguration('claudeCodeWorkspace.port')) {
-        bridgeServer?.close(() => startBridgeServer(context));
-        const config = await readClaudeJson();
-        if (config.mcpServers?.[MCP_KEY]) await configureClaude(getPort());
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      const addr = bridgeServer?.address();
+      const actualPort = typeof addr === 'object' && addr ? (addr as { port: number }).port : 0;
+      if (actualPort) {
+        try { await writeRegistry(actualPort); }
+        catch (e) { log(`! Failed to re-write registry on folder change: ${String(e)}`); }
       }
     })
   );
 
-  // First-run: prompt if not yet configured
+  // First-run: prompt if not yet configured (also fires if old VSCODE_BRIDGE_PORT config detected)
   const config = await readClaudeJson();
-  if (!isAlreadyConfigured(config, getPort(), bridgeSecret!)) {
+  if (!isAlreadyConfigured(config, bridgeSecret!)) {
     await promptSetup();
   }
 }
 
 export function deactivate(): void {
+  removeRegistry();
   bridgeServer?.close();
   statusBar?.dispose();
   output?.dispose();

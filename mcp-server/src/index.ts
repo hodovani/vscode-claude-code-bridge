@@ -1,5 +1,5 @@
 /**
- * MCP server — VS Code Workspace Bridge v0.10.0
+ * MCP server — VS Code Workspace Bridge v0.11.0
  *
  * Tools:
  *   bridge_health      → VS Code status, active file, open tabs
@@ -17,33 +17,116 @@
  *   lsp_read           → granular LSP read ops (type def, completions, inlay hints, etc.)
  *   refactor           → LSP write ops: rename (preview/apply), code actions
  *   format             → document/range formatters, organize imports, fix-all
+ *
+ * Multi-window routing: each VS Code window registers itself in
+ * ~/.claude-code-workspace/bridges/<pid>.json with its ephemeral port and
+ * workspaceFolders. This server discovers all live bridges and routes each
+ * request to the window whose workspaceFolders best match the file param.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { existsSync, readFileSync, readdirSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 
-const BRIDGE = `http://127.0.0.1:${process.env['VSCODE_BRIDGE_PORT'] ?? '29837'}`;
 const TOKEN = process.env['VSCODE_BRIDGE_TOKEN'];
 
-async function get<T>(path: string): Promise<T> {
+// ─── Legacy single-port mode ──────────────────────────────────────────────────
+// If VSCODE_BRIDGE_PORT is set (old v0.10.0 config), skip registry and use that port.
+const LEGACY_PORT = process.env['VSCODE_BRIDGE_PORT'];
+if (LEGACY_PORT) {
+  console.error('[vscode-workspace] VSCODE_BRIDGE_PORT is set — using legacy single-port mode. Re-run "Claude Code Workspace: Configure Claude Code" in VS Code to upgrade to v0.11.0 multi-window support.');
+}
+
+// ─── Bridge registry ──────────────────────────────────────────────────────────
+
+const BRIDGES_DIR = join(homedir(), '.claude-code-workspace', 'bridges');
+
+type BridgeEntry = { pid: number; port: number; workspaceFolders: string[]; startedAt: string };
+
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (e: unknown) {
+    const err = e as NodeJS.ErrnoException;
+    return err?.code === 'EPERM'; // process exists but we lack permission — still alive
+  }
+}
+
+function readBridges(): BridgeEntry[] {
+  if (!existsSync(BRIDGES_DIR)) return [];
+  let files: string[];
+  try { files = readdirSync(BRIDGES_DIR).filter(f => f.endsWith('.json')); }
+  catch { return []; }
+  const bridges: BridgeEntry[] = [];
+  for (const f of files) {
+    try {
+      const raw = readFileSync(join(BRIDGES_DIR, f), 'utf8');
+      const entry = JSON.parse(raw) as BridgeEntry;
+      if (isAlive(entry.pid)) bridges.push(entry);
+    } catch { /* skip malformed or unreadable entries */ }
+  }
+  return bridges;
+}
+
+function discoverBridge(filePath?: string): BridgeEntry {
+  // Legacy mode: bypass registry entirely
+  if (LEGACY_PORT) {
+    return { pid: 0, port: parseInt(LEGACY_PORT, 10), workspaceFolders: [], startedAt: '' };
+  }
+
+  const bridges = readBridges();
+  if (!bridges.length) {
+    throw new Error('No active VS Code bridges found. Make sure VS Code is open with the "Claude Code Workspace" extension enabled.');
+  }
+
+  if (filePath) {
+    // Longest-prefix match across workspaceFolders
+    const candidates = bridges
+      .map(b => {
+        const match = b.workspaceFolders.find(f => filePath.startsWith(f + '/') || filePath === f);
+        return { bridge: b, matchLen: match ? match.length : 0 };
+      })
+      .filter(c => c.matchLen > 0)
+      .sort((a, b) => b.matchLen - a.matchLen);
+    if (candidates.length) return candidates[0].bridge;
+  }
+
+  // Fallback: most-recently-started bridge
+  return bridges.slice().sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
+}
+
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+
+function extractFileParam(urlPath: string): string | undefined {
+  const qIdx = urlPath.indexOf('?');
+  if (qIdx < 0) return undefined;
+  const params = new URLSearchParams(urlPath.slice(qIdx + 1));
+  return params.get('file') ?? undefined;
+}
+
+async function get<T>(urlPath: string): Promise<T> {
+  const filePath = extractFileParam(urlPath);
+  const bridge = discoverBridge(filePath);
   const headers: Record<string, string> = {};
   if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
-  const res = await fetch(BRIDGE + path, { headers, signal: AbortSignal.timeout(15000) });
+  const url = `http://127.0.0.1:${bridge.port}${urlPath}`;
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
   if (res.status === 401) throw new Error('Bridge auth failed — re-run "Claude Code Workspace: Configure Claude Code" in VS Code.');
   if (!res.ok) throw new Error(`Bridge HTTP ${res.status}: ${await res.text()}`);
   return res.json() as Promise<T>;
 }
 
-const NOT_RUNNING = 'VS Code bridge is not reachable. Open VS Code with the "Claude Code Workspace" extension active.';
+const NOT_RUNNING = 'No active VS Code bridge found. Open a VS Code window with the "Claude Code Workspace" extension active.';
 
 function bridgeErr(e: unknown) {
   const msg = String(e);
-  const text = msg.includes('fetch failed') || msg.includes('ECONNREFUSED') || msg.includes('abort') ? NOT_RUNNING : `Error: ${msg}`;
+  const text = msg.includes('fetch failed') || msg.includes('ECONNREFUSED') || msg.includes('abort') || msg.includes('No active VS Code bridges') ? NOT_RUNNING : `Error: ${msg}`;
   return { content: [{ type: 'text' as const, text }], isError: true as const };
 }
 
-const server = new McpServer({ name: 'vscode-workspace', version: '0.10.0' });
+const server = new McpServer({ name: 'vscode-workspace', version: '0.11.0' });
 
 // ── bridge_health ─────────────────────────────────────────────────────────────
 server.registerTool('bridge_health', {

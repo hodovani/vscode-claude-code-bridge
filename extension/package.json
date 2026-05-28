@@ -2,7 +2,7 @@
   "name": "claude-code-workspace-hodovani",
   "displayName": "Claude Code Workspace (Hodovani fork)",
   "description": "Fork of andrewmkhoury.claude-code-workspace with shared-secret HTTP auth (VSCODE_BRIDGE_TOKEN) and the upstream double-shebang/icon-path bugs fixed.",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "publisher": "hodovani",
   "license": "Apache-2.0",
   "repository": {

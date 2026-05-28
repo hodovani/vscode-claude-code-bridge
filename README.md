@@ -86,6 +86,20 @@ A status bar indicator `$(plug) Claude Bridge` confirms the bridge is running.
 | `claudeCodeWorkspace.maxSearchResults` | `100` | Max text search results (up to 500). |
 | `claudeCodeWorkspace.maxReferences` | `200` | Max reference locations (up to 500). |
 
+## Multi-window support
+
+v0.11.0 adds full multi-window (multi-project) support. Each VS Code window:
+
+1. Binds an **ephemeral port** assigned by the OS kernel — no port conflicts, no configuration needed.
+2. Writes a registry entry at `~/.claude-code-workspace/bridges/<pid>.json` containing its port and workspace folders.
+3. Cleans up the entry on deactivation.
+
+The MCP server reads all registry entries on every tool call, skips dead processes, and routes to the correct window using **longest-prefix matching** on the `file` parameter against each window's workspace folders. If no file is provided (e.g. `workspace` tool), the most recently started window is used.
+
+**Migrating from v0.10.0**: after installing the extension, restart your VS Code window(s). The first-run prompt will re-appear — click **Set Up** once. This rewrites `~/.claude.json` to remove the now-redundant `VSCODE_BRIDGE_PORT` env var. If you have multiple windows, only one needs to run Set Up (the MCP server config is shared).
+
+**Legacy compatibility**: if `VSCODE_BRIDGE_PORT` is still set in `~/.claude.json` (old installs), the MCP server falls back to single-port mode and prints a warning to stderr.
+
 ## @claude Chat Participant
 
 Type `@claude` in VS Code Chat to talk to Claude Code directly inside VS Code. Requires the Claude Code CLI to be installed.
