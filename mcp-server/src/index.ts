@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * MCP server — VS Code Workspace Bridge v0.3.0
  *
