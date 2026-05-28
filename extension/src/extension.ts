@@ -13,6 +13,7 @@
 
 import * as http from 'http';
 import * as cp from 'child_process';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -21,12 +22,13 @@ import * as vscode from 'vscode';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const VERSION = '0.5.0';
+const VERSION = '0.8.0';
 const EXT_NAME = 'Claude Code Workspace';
 const MCP_KEY = 'vscode-workspace';
 /** Stable directory written outside the extension so the path survives updates. */
 const STABLE_DIR = path.join(os.homedir(), '.claude-code-workspace');
 const STABLE_SERVER = path.join(STABLE_DIR, 'mcp-server.mjs');
+const SECRET_FILE = path.join(STABLE_DIR, 'secret');
 const CLAUDE_JSON = path.join(os.homedir(), '.claude.json');
 
 // ─── Config helpers ───────────────────────────────────────────────────────────
@@ -79,12 +81,26 @@ async function writeClaudeJson(config: ClaudeConfig): Promise<void> {
   await fs.promises.writeFile(CLAUDE_JSON, JSON.stringify(config, null, 2) + '\n', 'utf8');
 }
 
-function isAlreadyConfigured(config: ClaudeConfig, port: number): boolean {
+function isAlreadyConfigured(config: ClaudeConfig, port: number, secret: string): boolean {
   const entry = config.mcpServers?.[MCP_KEY];
   if (!entry) return false;
   const argPath = entry.args?.[0];
   const portMatch = entry.env?.['VSCODE_BRIDGE_PORT'] === String(port);
-  return argPath === STABLE_SERVER && portMatch;
+  const tokenMatch = entry.env?.['VSCODE_BRIDGE_TOKEN'] === secret;
+  return argPath === STABLE_SERVER && portMatch && tokenMatch;
+}
+
+// ─── Secret helpers ───────────────────────────────────────────────────────────
+
+async function readOrCreateSecret(): Promise<string> {
+  try {
+    const existing = (await fs.promises.readFile(SECRET_FILE, 'utf8')).trim();
+    if (existing.length >= 32) return existing;
+  } catch { /* not present */ }
+  const token = crypto.randomBytes(32).toString('hex');
+  await fs.promises.mkdir(STABLE_DIR, { recursive: true });
+  await fs.promises.writeFile(SECRET_FILE, token, { mode: 0o600 });
+  return token;
 }
 
 // ─── MCP server sync ──────────────────────────────────────────────────────────
@@ -103,7 +119,7 @@ async function configureClaude(port: number): Promise<void> {
   config.mcpServers[MCP_KEY] = {
     command: 'node',
     args: [STABLE_SERVER],
-    env: { VSCODE_BRIDGE_PORT: String(port) },
+    env: { VSCODE_BRIDGE_PORT: String(port), VSCODE_BRIDGE_TOKEN: bridgeSecret! },
   };
   await writeClaudeJson(config);
 }
@@ -138,6 +154,13 @@ function flattenDocSymbols(symbols: vscode.DocumentSymbol[], depth = 0): object[
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${getPort()}`);
+
+  const authz = req.headers['authorization'];
+  if (authz !== `Bearer ${bridgeSecret}`) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing bearer token' }));
+    return;
+  }
 
   if (url.pathname === '/health') {
     jsonResponse(res, {
@@ -491,6 +514,7 @@ function registerChatParticipant(context: vscode.ExtensionContext): void {
 // ─── Bridge server ────────────────────────────────────────────────────────────
 
 let bridgeServer: http.Server | undefined;
+let bridgeSecret: string | undefined;
 let statusBar: vscode.StatusBarItem | undefined;
 
 function setStatus(text: string, tooltip: string, isError = false): void {
@@ -556,6 +580,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     console.error('[Claude Code Workspace] Failed to sync MCP server:', e);
   }
 
+  // Read or create the shared secret before starting the bridge
+  try {
+    bridgeSecret = await readOrCreateSecret();
+  } catch (e) {
+    console.error('[Claude Code Workspace] Failed to read/create secret:', e);
+    vscode.window.showErrorMessage(`${EXT_NAME}: failed to initialise auth token; bridge disabled.`);
+    return;
+  }
+
   // Start HTTP bridge
   startBridgeServer(context);
 
@@ -587,7 +620,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // First-run: prompt if not yet configured
   const config = await readClaudeJson();
-  if (!isAlreadyConfigured(config, getPort())) {
+  if (!isAlreadyConfigured(config, getPort(), bridgeSecret!)) {
     await promptSetup();
   }
 }

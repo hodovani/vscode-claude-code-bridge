@@ -15,9 +15,13 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 const BRIDGE = `http://127.0.0.1:${process.env['VSCODE_BRIDGE_PORT'] ?? '29837'}`;
+const TOKEN = process.env['VSCODE_BRIDGE_TOKEN'];
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(BRIDGE + path, { signal: AbortSignal.timeout(15000) });
+  const headers: Record<string, string> = {};
+  if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
+  const res = await fetch(BRIDGE + path, { headers, signal: AbortSignal.timeout(15000) });
+  if (res.status === 401) throw new Error('Bridge auth failed — re-run "Claude Code Workspace: Configure Claude Code" in VS Code.');
   if (!res.ok) throw new Error(`Bridge HTTP ${res.status}: ${await res.text()}`);
   return res.json() as Promise<T>;
 }
@@ -30,7 +34,7 @@ function bridgeErr(e: unknown) {
   return { content: [{ type: 'text' as const, text }], isError: true as const };
 }
 
-const server = new McpServer({ name: 'vscode-workspace', version: '0.7.1' });
+const server = new McpServer({ name: 'vscode-workspace', version: '0.8.0' });
 
 // ── search ────────────────────────────────────────────────────────────────────
 server.registerTool('search', {

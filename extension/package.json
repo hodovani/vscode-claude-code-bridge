@@ -2,7 +2,7 @@
   "name": "claude-code-workspace",
   "displayName": "Claude Code Workspace",
   "description": "Exposes VS Code's workspace intelligence (symbols, diagnostics, references, definitions, search) to Claude Code via a local MCP bridge.",
-  "version": "0.1.0",
+  "version": "0.8.0",
   "publisher": "andrewmkhoury",
   "license": "Apache-2.0",
   "repository": {
@@ -13,7 +13,7 @@
     "url": "https://github.com/andrewmkhoury/vscode-claude-code-bridge/issues"
   },
   "homepage": "https://github.com/andrewmkhoury/vscode-claude-code-bridge#readme",
-  "icon": "resources/icon.png",
+  "icon": "resources",
   "galleryBanner": {
     "color": "#1e1e2e",
     "theme": "dark"
