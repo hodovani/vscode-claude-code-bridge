@@ -631,31 +631,67 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const line  = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col   = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     const apply = url.searchParams.get('apply') === '1' || url.searchParams.get('apply') === 'true';
-    try {
-      const edit = await withTimeout(
-        vscode.commands.executeCommand<vscode.WorkspaceEdit>('vscode.executeDocumentRenameProvider', vscode.Uri.file(file), new vscode.Position(line, col), newName),
-        8000, 'Rename timed out'
-      );
-      if (!edit) { jsonResponse(res, { preview: [], applied: false }); return; }
-      const preview: { file: string; edits: { startLine: number; startCol: number; endLine: number; endCol: number; newText: string }[] }[] = [];
-      for (const [uri, textEdits] of edit.entries()) {
+    // The rename provider requires the document to be loaded into VS Code's text model.
+    // Pre-open AND warm the language server by triggering documentSymbolProvider,
+    // which forces the TS/Python/etc. server to attach to the document before rename runs.
+    try { await vscode.workspace.openTextDocument(vscode.Uri.file(file)); }
+    catch (e) { jsonResponse(res, { error: `openTextDocument: ${String(e)}` }, 500); return; }
+    try { await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', vscode.Uri.file(file)); }
+    catch { /* warming is best-effort */ }
+    let edit: vscode.WorkspaceEdit | undefined;
+    // Retry on empty edit — first-after-restart TS calls can return an empty WorkspaceEdit.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        edit = await withTimeout(
+          vscode.commands.executeCommand<vscode.WorkspaceEdit>('vscode.executeDocumentRenameProvider', vscode.Uri.file(file), new vscode.Position(line, col), newName),
+          8000, 'Rename timed out'
+        );
+      } catch (e) { jsonResponse(res, { error: `executeCommand: ${String(e)}` }, 500); return; }
+      if (edit && edit.size > 0) break;
+      if (attempt < 2) await new Promise(r => setTimeout(r, 300));
+    }
+    if (!edit) { jsonResponse(res, { preview: [], applied: false }); return; }
+    const preview: { file: string; edits: { startLine: number; startCol: number; endLine: number; endCol: number; newText: string }[] }[] = [];
+    let entries: ReadonlyArray<[vscode.Uri, vscode.TextEdit[]]>;
+    try { entries = edit.entries(); }
+    catch (e) { jsonResponse(res, { error: `edit.entries(): ${String(e)}` }, 500); return; }
+    for (let i = 0; i < entries.length; i++) {
+      try {
+        const [uri, textEdits] = entries[i];
+        const fpath = (uri as { fsPath?: string }).fsPath ?? (uri && typeof (uri as { toString?: () => string }).toString === 'function' ? (uri as { toString: () => string }).toString() : String(uri));
         preview.push({
-          file: uri.fsPath,
-          edits: textEdits.map(te => ({
-            startLine: te.range.start.line + 1,
-            startCol: te.range.start.character + 1,
-            endLine: te.range.end.line + 1,
-            endCol: te.range.end.character + 1,
-            newText: te.newText,
-          })),
+          file: fpath,
+          edits: (textEdits ?? []).map(te => {
+            const r = (te as { range?: vscode.Range }).range;
+            return {
+              startLine: (r?.start?.line ?? 0) + 1,
+              startCol:  (r?.start?.character ?? 0) + 1,
+              endLine:   (r?.end?.line ?? 0) + 1,
+              endCol:    (r?.end?.character ?? 0) + 1,
+              newText:   (te as { newText?: string }).newText ?? '',
+            };
+          }),
         });
+      } catch (e) {
+        jsonResponse(res, { error: `entry[${i}]: ${String(e)}`, preview }, 500);
+        return;
       }
-      let applied = false;
-      if (apply) {
-        applied = await vscode.workspace.applyEdit(edit);
+    }
+    if (!apply) { jsonResponse(res, { preview, applied: false }); return; }
+    let applied = false;
+    try { applied = await vscode.workspace.applyEdit(edit); }
+    catch (e) { jsonResponse(res, { error: `applyEdit: ${String(e)}`, preview }, 500); return; }
+    // applyEdit modifies in-memory documents but doesn't save. Persist them.
+    let saved = 0;
+    if (applied) {
+      for (const [uri] of entries) {
+        try {
+          const doc = await vscode.workspace.openTextDocument(uri);
+          if (doc.isDirty && await doc.save()) saved++;
+        } catch { /* skip individual save failures */ }
       }
-      jsonResponse(res, { preview, applied });
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    }
+    jsonResponse(res, { preview, applied, saved });
     return;
   }
 
