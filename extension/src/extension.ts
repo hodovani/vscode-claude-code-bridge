@@ -1,5 +1,5 @@
 /**
- * Claude Code Workspace Bridge — VS Code Extension v0.5.0
+ * Claude Code Workspace Bridge — VS Code Extension v0.9.0
  *
  * On activation:
  *   1. Starts a local HTTP server exposing VS Code workspace intelligence.
@@ -8,7 +8,9 @@
  *
  * Endpoints:
  *   /health, /symbols, /document-symbols, /hover, /files, /active-editor,
- *   /diagnostics, /definition, /references, /call-hierarchy, /git-status, /search
+ *   /diagnostics, /definition, /references, /call-hierarchy, /git-status, /search,
+ *   /type-definition, /implementation, /declaration, /signature-help, /completion,
+ *   /inlay-hints, /document-highlights, /rename, /code-actions, /apply-code-action
  */
 
 import * as http from 'http';
@@ -22,7 +24,7 @@ import * as vscode from 'vscode';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 const EXT_NAME = 'Claude Code Workspace';
 const MCP_KEY = 'vscode-workspace';
 /** Stable directory written outside the extension so the path survives updates. */
@@ -462,6 +464,269 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         });
       });
       jsonResponse(res, results);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/type-definition') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
+    const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
+    try {
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>('vscode.executeTypeDefinitionProvider', vscode.Uri.file(file), new vscode.Position(line, col)),
+        8000, 'Type definition query timed out'
+      );
+      const locs = (raw ?? []).map(l => {
+        const { uri, range } = 'targetUri' in l ? { uri: l.targetUri, range: l.targetRange } : l;
+        return { file: uri.fsPath, startLine: range.start.line + 1, startCol: range.start.character + 1 };
+      });
+      jsonResponse(res, locs);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/implementation') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
+    const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
+    try {
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>('vscode.executeImplementationProvider', vscode.Uri.file(file), new vscode.Position(line, col)),
+        8000, 'Implementation query timed out'
+      );
+      const locs = (raw ?? []).map(l => {
+        const { uri, range } = 'targetUri' in l ? { uri: l.targetUri, range: l.targetRange } : l;
+        return { file: uri.fsPath, startLine: range.start.line + 1, startCol: range.start.character + 1 };
+      });
+      jsonResponse(res, locs);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/declaration') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
+    const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
+    try {
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>('vscode.executeDeclarationProvider', vscode.Uri.file(file), new vscode.Position(line, col)),
+        8000, 'Declaration query timed out'
+      );
+      const locs = (raw ?? []).map(l => {
+        const { uri, range } = 'targetUri' in l ? { uri: l.targetUri, range: l.targetRange } : l;
+        return { file: uri.fsPath, startLine: range.start.line + 1, startCol: range.start.character + 1 };
+      });
+      jsonResponse(res, locs);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/signature-help') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
+    const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
+    try {
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<vscode.SignatureHelp>('vscode.executeSignatureHelpProvider', vscode.Uri.file(file), new vscode.Position(line, col)),
+        8000, 'Signature help timed out'
+      );
+      if (!raw) { jsonResponse(res, null); return; }
+      const result = {
+        signatures: raw.signatures.map(sig => ({
+          label: sig.label,
+          documentation: typeof sig.documentation === 'string' ? sig.documentation : (sig.documentation as vscode.MarkdownString | undefined)?.value ?? '',
+          parameters: sig.parameters.map(p => ({
+            label: Array.isArray(p.label) ? p.label.join('-') : p.label,
+            documentation: typeof p.documentation === 'string' ? p.documentation : (p.documentation as vscode.MarkdownString | undefined)?.value ?? '',
+          })),
+        })),
+        activeSignature: raw.activeSignature ?? 0,
+        activeParameter: raw.activeParameter ?? 0,
+      };
+      jsonResponse(res, result);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/completion') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const line  = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
+    const col   = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10), 200);
+    try {
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider', vscode.Uri.file(file), new vscode.Position(line, col)),
+        8000, 'Completion timed out'
+      );
+      const items = ((raw?.items ?? []) as vscode.CompletionItem[]).slice(0, limit).map(d => ({
+        label: typeof d.label === 'string' ? d.label : (d.label as vscode.CompletionItemLabel).label,
+        kind: vscode.CompletionItemKind[d.kind ?? 0] ?? String(d.kind),
+        detail: d.detail ?? '',
+        documentation: typeof d.documentation === 'string' ? d.documentation : (d.documentation as vscode.MarkdownString | undefined)?.value ?? '',
+        insertText: typeof d.insertText === 'string' ? d.insertText : (d.insertText as vscode.SnippetString | undefined)?.value ?? (typeof d.label === 'string' ? d.label : (d.label as vscode.CompletionItemLabel).label),
+        sortText: d.sortText ?? '',
+      }));
+      jsonResponse(res, items);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/inlay-hints') {
+    const file      = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const startLine = Math.max(0, parseInt(url.searchParams.get('startLine') ?? '1', 10) - 1);
+    const endLine   = Math.max(0, parseInt(url.searchParams.get('endLine')   ?? '1', 10) - 1);
+    try {
+      const range = new vscode.Range(new vscode.Position(startLine, 0), new vscode.Position(endLine, Number.MAX_SAFE_INTEGER));
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<vscode.InlayHint[]>('vscode.executeInlayHintProvider', vscode.Uri.file(file), range),
+        8000, 'Inlay hints timed out'
+      );
+      const hints = (raw ?? []).map(h => ({
+        line: h.position.line + 1,
+        col: h.position.character + 1,
+        label: Array.isArray(h.label) ? h.label.map(p => (typeof p === 'string' ? p : p.value)).join('') : h.label,
+        kind: vscode.InlayHintKind[h.kind ?? 0] ?? String(h.kind),
+        paddingLeft: h.paddingLeft ?? false,
+        paddingRight: h.paddingRight ?? false,
+      }));
+      jsonResponse(res, hints);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/document-highlights') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
+    const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
+    try {
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<vscode.DocumentHighlight[]>('vscode.executeDocumentHighlights', vscode.Uri.file(file), new vscode.Position(line, col)),
+        8000, 'Document highlights timed out'
+      );
+      const highlights = (raw ?? []).map(h => ({
+        startLine: h.range.start.line + 1,
+        startCol: h.range.start.character + 1,
+        endLine: h.range.end.line + 1,
+        endCol: h.range.end.character + 1,
+        kind: vscode.DocumentHighlightKind[h.kind ?? vscode.DocumentHighlightKind.Text] ?? String(h.kind),
+      }));
+      jsonResponse(res, highlights);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/rename') {
+    const file    = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const newName = url.searchParams.get('newName');
+    if (!newName) { jsonResponse(res, { error: 'newName param required' }, 400); return; }
+    const line  = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
+    const col   = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
+    const apply = url.searchParams.get('apply') === '1' || url.searchParams.get('apply') === 'true';
+    try {
+      const edit = await withTimeout(
+        vscode.commands.executeCommand<vscode.WorkspaceEdit>('vscode.executeDocumentRenameProvider', vscode.Uri.file(file), new vscode.Position(line, col), newName),
+        8000, 'Rename timed out'
+      );
+      if (!edit) { jsonResponse(res, { preview: [], applied: false }); return; }
+      const preview: { file: string; edits: { startLine: number; startCol: number; endLine: number; endCol: number; newText: string }[] }[] = [];
+      for (const [uri, textEdits] of edit.entries()) {
+        preview.push({
+          file: uri.fsPath,
+          edits: textEdits.map(te => ({
+            startLine: te.range.start.line + 1,
+            startCol: te.range.start.character + 1,
+            endLine: te.range.end.line + 1,
+            endCol: te.range.end.character + 1,
+            newText: te.newText,
+          })),
+        });
+      }
+      let applied = false;
+      if (apply) {
+        applied = await vscode.workspace.applyEdit(edit);
+      }
+      jsonResponse(res, { preview, applied });
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/code-actions') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const startLine = Math.max(0, parseInt(url.searchParams.get('startLine') ?? '1', 10) - 1);
+    const startCol  = Math.max(0, parseInt(url.searchParams.get('startCol')  ?? '1', 10) - 1);
+    const endLine   = Math.max(0, parseInt(url.searchParams.get('endLine')   ?? url.searchParams.get('startLine') ?? '1', 10) - 1);
+    const endCol    = Math.max(0, parseInt(url.searchParams.get('endCol')    ?? url.searchParams.get('startCol')  ?? '1', 10) - 1);
+    const kindFilter = url.searchParams.get('kindFilter');
+    try {
+      const range = new vscode.Range(new vscode.Position(startLine, startCol), new vscode.Position(endLine, endCol));
+      const kind  = kindFilter ? new vscode.CodeActionKind(kindFilter) : undefined;
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<(vscode.Command | vscode.CodeAction)[]>('vscode.executeCodeActionProvider', vscode.Uri.file(file), range, kind?.value),
+        8000, 'Code actions timed out'
+      );
+      const actions = (raw ?? []).map((a, index) => {
+        if ('command' in a && typeof (a as vscode.Command).command === 'string' && !('title' in a && typeof (a as { title?: unknown }).title === 'string' && !('kind' in a))) {
+          const cmd = a as vscode.Command;
+          return { title: cmd.title, kind: '', isPreferred: false, index };
+        }
+        const ca = a as vscode.CodeAction;
+        return {
+          title: ca.title,
+          kind: ca.kind?.value ?? '',
+          isPreferred: ca.isPreferred ?? false,
+          index,
+        };
+      });
+      jsonResponse(res, actions);
+    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/apply-code-action') {
+    const file = url.searchParams.get('file');
+    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    const startLine  = Math.max(0, parseInt(url.searchParams.get('startLine') ?? '1', 10) - 1);
+    const startCol   = Math.max(0, parseInt(url.searchParams.get('startCol')  ?? '1', 10) - 1);
+    const endLine    = Math.max(0, parseInt(url.searchParams.get('endLine')   ?? url.searchParams.get('startLine') ?? '1', 10) - 1);
+    const endCol     = Math.max(0, parseInt(url.searchParams.get('endCol')    ?? url.searchParams.get('startCol')  ?? '1', 10) - 1);
+    const kindFilter = url.searchParams.get('kindFilter');
+    const actionIndexStr = url.searchParams.get('actionIndex');
+    if (actionIndexStr === null) { jsonResponse(res, { error: 'actionIndex param required' }, 400); return; }
+    const actionIndex = parseInt(actionIndexStr, 10);
+    try {
+      const range = new vscode.Range(new vscode.Position(startLine, startCol), new vscode.Position(endLine, endCol));
+      const kind  = kindFilter ? new vscode.CodeActionKind(kindFilter) : undefined;
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<(vscode.Command | vscode.CodeAction)[]>('vscode.executeCodeActionProvider', vscode.Uri.file(file), range, kind?.value),
+        8000, 'Code actions timed out'
+      );
+      const actions = raw ?? [];
+      if (actionIndex < 0 || actionIndex >= actions.length) {
+        jsonResponse(res, { applied: false, title: '' });
+        return;
+      }
+      const action = actions[actionIndex];
+      const ca = action as vscode.CodeAction;
+      const title = ca.title ?? (action as vscode.Command).title ?? '';
+      let applied = false;
+      if (ca.edit) {
+        applied = await vscode.workspace.applyEdit(ca.edit);
+      }
+      if (ca.command) {
+        await vscode.commands.executeCommand(ca.command.command, ...(ca.command.arguments ?? []));
+        applied = true;
+      }
+      jsonResponse(res, { applied, title });
     } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
     return;
   }

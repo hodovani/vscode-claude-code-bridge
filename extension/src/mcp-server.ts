@@ -1,12 +1,14 @@
 /**
- * MCP server — VS Code Workspace Bridge v0.7.1
+ * MCP server — VS Code Workspace Bridge v0.9.0
  *
- * IMPORTANT FOR CLAUDE: When running inside VS Code, prefer these 3 tools
+ * IMPORTANT FOR CLAUDE: When running inside VS Code, prefer these 5 tools
  * over built-in Grep, Glob, Bash, or Read for code navigation tasks.
  *
  *   search(type, query)  → find symbols, text, or files (prefer over Grep/Glob)
  *   inspect(file, ...)   → file outline OR full position intel (prefer over Read/Grep)
  *   workspace()          → active editor + git + diagnostics in one call
+ *   lsp_read(action, ..) → granular LSP read ops (type def, completions, inlay hints, etc.)
+ *   refactor(action, ..) → LSP write ops: rename (preview/apply), code actions
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -33,7 +35,7 @@ function bridgeErr(e: unknown) {
   return { content: [{ type: 'text' as const, text }], isError: true as const };
 }
 
-const server = new McpServer({ name: 'vscode-workspace', version: '0.8.0' });
+const server = new McpServer({ name: 'vscode-workspace', version: '0.9.0' });
 
 // ── search ────────────────────────────────────────────────────────────────────
 server.registerTool('search', {
@@ -209,6 +211,174 @@ server.registerTool('workspace', {
     }
 
     return { content: [{ type: 'text', text: parts.join('\n\n') }] };
+  } catch (e) { return bridgeErr(e); }
+});
+
+// ── lsp_read ──────────────────────────────────────────────────────────────────
+server.registerTool('lsp_read', {
+  description:
+    'Granular LSP read operations not covered by inspect/search. ' +
+    '"type_definition" — go to the type that defines the symbol (e.g. the interface behind a variable); ' +
+    '"implementation" — find concrete implementations of an interface or abstract method; ' +
+    '"declaration" — go to the declaration (for languages that distinguish declaration from definition); ' +
+    '"signature_help" — get parameter hints for the function call at the cursor; ' +
+    '"completion" — get completion candidates at a position; ' +
+    '"inlay_hints" — get inlay hint labels (type annotations, parameter names) for a line range; ' +
+    '"document_highlights" — find all occurrences of a symbol within the current file.',
+  inputSchema: {
+    action:    z.enum(['type_definition', 'implementation', 'declaration', 'signature_help', 'completion', 'inlay_hints', 'document_highlights']),
+    file:      z.string().describe('Absolute path to the file'),
+    line:      z.coerce.number().int().min(1).optional().describe('1-based line (required for all except inlay_hints)'),
+    col:       z.coerce.number().int().min(1).optional().describe('1-based column (required for all except inlay_hints)'),
+    startLine: z.coerce.number().int().min(1).optional().describe('1-based start line (required for inlay_hints)'),
+    endLine:   z.coerce.number().int().min(1).optional().describe('1-based end line (required for inlay_hints)'),
+    limit:     z.number().int().min(1).max(200).default(50).describe('Max completions to return (completion only)'),
+  },
+}, async ({ action, file, line, col, startLine, endLine, limit }) => {
+  try {
+    if (action === 'type_definition') {
+      const params = new URLSearchParams({ file, line: String(line ?? 1), col: String(col ?? 1) });
+      type Loc = { file: string; startLine: number; startCol: number };
+      const locs = await get<Loc[]>(`/type-definition?${params}`);
+      if (!locs.length) return { content: [{ type: 'text', text: `No type definition at ${file}:${line}:${col}.` }] };
+      return { content: [{ type: 'text', text: `## Type definition\n${locs.map(l => `${l.file}:${l.startLine}:${l.startCol}`).join('\n')}` }] };
+    }
+
+    if (action === 'implementation') {
+      const params = new URLSearchParams({ file, line: String(line ?? 1), col: String(col ?? 1) });
+      type Loc = { file: string; startLine: number; startCol: number };
+      const locs = await get<Loc[]>(`/implementation?${params}`);
+      if (!locs.length) return { content: [{ type: 'text', text: `No implementations at ${file}:${line}:${col}.` }] };
+      return { content: [{ type: 'text', text: `## Implementations (${locs.length})\n${locs.map(l => `${l.file}:${l.startLine}:${l.startCol}`).join('\n')}` }] };
+    }
+
+    if (action === 'declaration') {
+      const params = new URLSearchParams({ file, line: String(line ?? 1), col: String(col ?? 1) });
+      type Loc = { file: string; startLine: number; startCol: number };
+      const locs = await get<Loc[]>(`/declaration?${params}`);
+      if (!locs.length) return { content: [{ type: 'text', text: `No declaration at ${file}:${line}:${col}.` }] };
+      return { content: [{ type: 'text', text: `## Declaration\n${locs.map(l => `${l.file}:${l.startLine}:${l.startCol}`).join('\n')}` }] };
+    }
+
+    if (action === 'signature_help') {
+      const params = new URLSearchParams({ file, line: String(line ?? 1), col: String(col ?? 1) });
+      type SigHelp = { signatures: { label: string; documentation: string; parameters: { label: string; documentation: string }[] }[]; activeSignature: number; activeParameter: number } | null;
+      const sh = await get<SigHelp>(`/signature-help?${params}`);
+      if (!sh || !sh.signatures.length) return { content: [{ type: 'text', text: `No signature help at ${file}:${line}:${col}.` }] };
+      const sig = sh.signatures[sh.activeSignature ?? 0];
+      const lines = [`## Signature help at ${line}:${col}`, `\`${sig.label}\``];
+      if (sig.documentation) lines.push(sig.documentation);
+      if (sig.parameters.length) {
+        lines.push(`\nParameters (active: ${sh.activeParameter ?? 0}):`);
+        sig.parameters.forEach((p, i) => lines.push(`  ${i === (sh.activeParameter ?? 0) ? '>' : ' '} ${p.label}${p.documentation ? ` — ${p.documentation}` : ''}`));
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    if (action === 'completion') {
+      const params = new URLSearchParams({ file, line: String(line ?? 1), col: String(col ?? 1), limit: String(limit) });
+      type CompItem = { label: string; kind: string; detail: string; documentation: string; insertText: string; sortText: string };
+      const items = await get<CompItem[]>(`/completion?${params}`);
+      if (!items.length) return { content: [{ type: 'text', text: `No completions at ${file}:${line}:${col}.` }] };
+      const text = `## Completions at ${line}:${col} (${items.length})\n` +
+        items.map(i => `[${i.kind}] ${i.label}${i.detail ? `  — ${i.detail}` : ''}${i.documentation ? `\n    ${i.documentation.slice(0, 120)}` : ''}`).join('\n');
+      return { content: [{ type: 'text', text }] };
+    }
+
+    if (action === 'inlay_hints') {
+      const params = new URLSearchParams({ file, startLine: String(startLine ?? 1), endLine: String(endLine ?? startLine ?? 1) });
+      type Hint = { line: number; col: number; label: string; kind: string; paddingLeft: boolean; paddingRight: boolean };
+      const hints = await get<Hint[]>(`/inlay-hints?${params}`);
+      if (!hints.length) return { content: [{ type: 'text', text: `No inlay hints in ${file} lines ${startLine}–${endLine}.` }] };
+      const text = `## Inlay hints (${hints.length})\n` +
+        hints.map(h => `L${h.line}:${h.col}  [${h.kind}] ${h.paddingLeft ? ' ' : ''}${h.label}${h.paddingRight ? ' ' : ''}`).join('\n');
+      return { content: [{ type: 'text', text }] };
+    }
+
+    // document_highlights
+    const params = new URLSearchParams({ file, line: String(line ?? 1), col: String(col ?? 1) });
+    type Highlight = { startLine: number; startCol: number; endLine: number; endCol: number; kind: string };
+    const highlights = await get<Highlight[]>(`/document-highlights?${params}`);
+    if (!highlights.length) return { content: [{ type: 'text', text: `No highlights at ${file}:${line}:${col}.` }] };
+    const text = `## Document highlights (${highlights.length})\n` +
+      highlights.map(h => `L${h.startLine}:${h.startCol}–L${h.endLine}:${h.endCol}  [${h.kind}]`).join('\n');
+    return { content: [{ type: 'text', text }] };
+  } catch (e) { return bridgeErr(e); }
+});
+
+// ── refactor ──────────────────────────────────────────────────────────────────
+server.registerTool('refactor', {
+  description:
+    'LSP write operations: rename symbols and apply code actions. ' +
+    '"rename" — rename a symbol across the workspace. Set apply=false (default) for a dry-run preview; apply=true to actually apply. ' +
+    '"code_actions" — list available code actions (quick fixes, refactors) for a range. Returns a numbered list with index values. ' +
+    '"apply_code_action" — apply a specific code action by its index from a prior code_actions call.',
+  inputSchema: {
+    action:      z.enum(['rename', 'code_actions', 'apply_code_action']),
+    file:        z.string().describe('Absolute path to the file'),
+    line:        z.coerce.number().int().min(1).describe('1-based line number'),
+    col:         z.coerce.number().int().min(1).describe('1-based column number'),
+    endLine:     z.coerce.number().int().min(1).optional().describe('1-based end line (code_actions range; defaults to line)'),
+    endCol:      z.coerce.number().int().min(1).optional().describe('1-based end col (code_actions range; defaults to col)'),
+    newName:     z.string().optional().describe('New name (required for rename)'),
+    apply:       z.boolean().default(false).describe('For rename: false = preview only, true = apply edits'),
+    kindFilter:  z.string().optional().describe('Code action kind filter, e.g. "quickfix" or "refactor"'),
+    actionIndex: z.number().int().min(0).optional().describe('Index from prior code_actions call (required for apply_code_action)'),
+  },
+}, async ({ action, file, line, col, endLine, endCol, newName, apply, kindFilter, actionIndex }) => {
+  try {
+    if (action === 'rename') {
+      if (!newName) return { content: [{ type: 'text', text: 'Error: newName is required for rename.' }], isError: true };
+      const params = new URLSearchParams({ file, line: String(line), col: String(col), newName, apply: apply ? '1' : '0' });
+      type RenameResult = { preview: { file: string; edits: { startLine: number; startCol: number; endLine: number; endCol: number; newText: string }[] }[]; applied: boolean };
+      const result = await get<RenameResult>(`/rename?${params}`);
+      if (!result.preview.length) return { content: [{ type: 'text', text: `No rename edits found at ${file}:${line}:${col}.` }] };
+
+      const totalEdits = result.preview.reduce((sum, f) => sum + f.edits.length, 0);
+      const fileCount = result.preview.length;
+      const lines: string[] = [];
+
+      if (apply) {
+        lines.push(`Applied ${totalEdits} edit${totalEdits !== 1 ? 's' : ''} across ${fileCount} file${fileCount !== 1 ? 's' : ''}.`);
+      } else {
+        lines.push('## Rename preview (not applied)');
+        for (const f of result.preview) {
+          lines.push(`${f.file}:`);
+          for (const e of f.edits) {
+            lines.push(`  L${e.startLine}:${e.startCol}–L${e.endLine}:${e.endCol}  ${newName}`);
+          }
+        }
+        lines.push('');
+        lines.push('Re-run with apply=true to apply.');
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    if (action === 'code_actions') {
+      const resolvedEndLine = endLine ?? line;
+      const resolvedEndCol  = endCol  ?? col;
+      const params = new URLSearchParams({ file, startLine: String(line), startCol: String(col), endLine: String(resolvedEndLine), endCol: String(resolvedEndCol) });
+      if (kindFilter) params.set('kindFilter', kindFilter);
+      type ActionItem = { title: string; kind: string; isPreferred: boolean; index: number };
+      const actions = await get<ActionItem[]>(`/code-actions?${params}`);
+      if (!actions.length) return { content: [{ type: 'text', text: `No code actions at ${file}:${line}:${col}.` }] };
+      const text = `## Code actions (${actions.length})\n` +
+        actions.map(a => `[${a.index}] ${a.title}${a.kind ? ` (${a.kind})` : ''}${a.isPreferred ? '  ★ preferred' : ''}`).join('\n');
+      return { content: [{ type: 'text', text }] };
+    }
+
+    // apply_code_action
+    if (actionIndex === undefined || actionIndex === null) {
+      return { content: [{ type: 'text', text: 'Error: actionIndex is required for apply_code_action.' }], isError: true };
+    }
+    const resolvedEndLine = endLine ?? line;
+    const resolvedEndCol  = endCol  ?? col;
+    const params = new URLSearchParams({ file, startLine: String(line), startCol: String(col), endLine: String(resolvedEndLine), endCol: String(resolvedEndCol), actionIndex: String(actionIndex) });
+    if (kindFilter) params.set('kindFilter', kindFilter);
+    type ApplyResult = { applied: boolean; title: string };
+    const result = await get<ApplyResult>(`/apply-code-action?${params}`);
+    if (!result.applied) return { content: [{ type: 'text', text: `Code action at index ${actionIndex} could not be applied (action may no longer exist).` }] };
+    return { content: [{ type: 'text', text: `Applied: "${result.title}"` }] };
   } catch (e) { return bridgeErr(e); }
 });
 

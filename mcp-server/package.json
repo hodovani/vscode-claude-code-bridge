@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-vscode",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "MCP server that exposes VS Code workspace intelligence (symbols, diagnostics, references, definitions, text search) to Claude Code via the Claude Code Workspace extension.",
   "license": "Apache-2.0",
   "author": "akhoury",
