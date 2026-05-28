@@ -1,18 +1,18 @@
 {
-  "name": "claude-code-workspace",
-  "displayName": "Claude Code Workspace",
-  "description": "Exposes VS Code's workspace intelligence (symbols, diagnostics, references, definitions, search) to Claude Code via a local MCP bridge.",
+  "name": "claude-code-workspace-hodovani",
+  "displayName": "Claude Code Workspace (Hodovani fork)",
+  "description": "Fork of andrewmkhoury.claude-code-workspace with shared-secret HTTP auth (VSCODE_BRIDGE_TOKEN) and the upstream double-shebang/icon-path bugs fixed.",
   "version": "0.8.0",
-  "publisher": "andrewmkhoury",
+  "publisher": "hodovani",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/andrewmkhoury/vscode-claude-code-bridge"
+    "url": "https://github.com/hodovani/vscode-claude-code-bridge"
   },
   "bugs": {
-    "url": "https://github.com/andrewmkhoury/vscode-claude-code-bridge/issues"
+    "url": "https://github.com/hodovani/vscode-claude-code-bridge/issues"
   },
-  "homepage": "https://github.com/andrewmkhoury/vscode-claude-code-bridge#readme",
+  "homepage": "https://github.com/hodovani/vscode-claude-code-bridge#readme",
   "icon": "resources",
   "galleryBanner": {
     "color": "#1e1e2e",
