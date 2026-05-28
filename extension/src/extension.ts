@@ -1,5 +1,5 @@
 /**
- * Claude Code Workspace Bridge — VS Code Extension v0.9.0
+ * Claude Code Workspace Bridge — VS Code Extension v0.10.0
  *
  * On activation:
  *   1. Starts a local HTTP server exposing VS Code workspace intelligence.
@@ -10,7 +10,8 @@
  *   /health, /symbols, /document-symbols, /hover, /files, /active-editor,
  *   /diagnostics, /definition, /references, /call-hierarchy, /git-status, /search,
  *   /type-definition, /implementation, /declaration, /signature-help, /completion,
- *   /inlay-hints, /document-highlights, /rename, /code-actions, /apply-code-action
+ *   /inlay-hints, /document-highlights, /rename, /code-actions, /apply-code-action,
+ *   /format, /format-range, /organize-imports, /fix-all
  */
 
 import * as http from 'http';
@@ -24,7 +25,7 @@ import * as vscode from 'vscode';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 const EXT_NAME = 'Claude Code Workspace';
 const MCP_KEY = 'vscode-workspace';
 /** Stable directory written outside the extension so the path survives updates. */
@@ -32,6 +33,13 @@ const STABLE_DIR = path.join(os.homedir(), '.claude-code-workspace');
 const STABLE_SERVER = path.join(STABLE_DIR, 'mcp-server.mjs');
 const SECRET_FILE = path.join(STABLE_DIR, 'secret');
 const CLAUDE_JSON = path.join(os.homedir(), '.claude.json');
+
+// ─── Output channel ───────────────────────────────────────────────────────────
+
+let output: vscode.OutputChannel | undefined;
+function log(line: string): void {
+  output?.appendLine(`[${new Date().toISOString().slice(11, 23)}] ${line}`);
+}
 
 // ─── Config helpers ───────────────────────────────────────────────────────────
 
@@ -145,6 +153,23 @@ function withTimeout<T>(promise: Promise<T>, ms: number, msg: string): Promise<T
   return Promise.race([promise, new Promise<T>((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 }
 
+function translateError(e: unknown): string {
+  const raw = String(e);
+  if (/Unexpected type/i.test(raw)) {
+    return 'Language server is in an unexpected state. The bridge auto-opens documents for rename/refactor — if you see this on other operations, ensure the file is in an active language project (tsconfig.json / pyproject.toml / pom.xml / etc.) and the relevant VS Code language extension is enabled.';
+  }
+  if (/Illegal argument/i.test(raw)) {
+    return 'Position out of range or invalid argument. Verify line/col are 1-based and within the file. For code_actions, ensure startLine ≤ endLine and the range is non-empty.';
+  }
+  if (/Cannot find module/i.test(raw) || /not in tsconfig/i.test(raw)) {
+    return 'File is not in any active language project. Check that the file is included by tsconfig.json / jsconfig.json / pyproject.toml / etc., and that the corresponding language server has loaded it.';
+  }
+  if (/timed out/i.test(raw)) {
+    return `${raw} — try restarting the language server: Cmd+Shift+P → "<Language>: Restart Server", or check the Claude Code Workspace output channel for details.`;
+  }
+  return raw;
+}
+
 function flattenDocSymbols(symbols: vscode.DocumentSymbol[], depth = 0): object[] {
   const rows: object[] = [];
   for (const s of symbols) {
@@ -159,13 +184,22 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
   const authz = req.headers['authorization'];
   if (authz !== `Bearer ${bridgeSecret}`) {
+    log(`← ${req.method} ${url.pathname} 401 (auth)`);
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing bearer token' }));
     return;
   }
 
+  const startTime = Date.now();
+  log(`→ ${req.method} ${url.pathname}${url.search}`);
+
+  const respond = (data: unknown, status = 200): void => {
+    log(`← ${req.method} ${url.pathname} ${status} (${Date.now() - startTime}ms)`);
+    jsonResponse(res, data, status);
+  };
+
   if (url.pathname === '/health') {
-    jsonResponse(res, {
+    respond({
       ok: true,
       version: VERSION,
       workspaceFolders: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
@@ -180,10 +214,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // and typescript.tsserverRequest 'navto' is blocked by the TS extension's allowlist.
     const q     = url.searchParams.get('q') ?? '';
     const limit = Math.min(parseInt(url.searchParams.get('limit') ?? String(cfg<number>('maxSymbols') || 50), 10), 200);
-    if (!q) { jsonResponse(res, []); return; }
+    if (!q) { respond([]); return; }
 
     const folders = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
-    if (!folders.length) { jsonResponse(res, []); return; }
+    if (!folders.length) { respond([]); return; }
 
     const appRoot   = vscode.env.appRoot;
     const bundledRg = path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', 'rg');
@@ -244,27 +278,27 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     try {
       let rows = await runRg(defPattern);
       if (rows.length === 0) rows = await runRg(`\\b${qe}\\b`);
-      jsonResponse(res, rows);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(rows);
+    } catch (e) { log(`! /symbols: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/document-symbols') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     try {
       const raw = await withTimeout(
         vscode.commands.executeCommand<vscode.DocumentSymbol[]>('vscode.executeDocumentSymbolProvider', vscode.Uri.file(file)),
         8000, 'Document symbol query timed out'
       );
-      jsonResponse(res, flattenDocSymbols(raw ?? []));
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(flattenDocSymbols(raw ?? []));
+    } catch (e) { log(`! /document-symbols: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/hover') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     try {
@@ -277,8 +311,8 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           typeof c === 'string' ? c : (c as vscode.MarkdownString).value ?? ''
         )
       ).filter(Boolean);
-      jsonResponse(res, { contents });
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond({ contents });
+    } catch (e) { log(`! /hover: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
@@ -288,17 +322,17 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const limit = parseInt(url.searchParams.get('limit') ?? String(cfg<number>('maxFiles') || 200), 10);
     try {
       const uris = await vscode.workspace.findFiles(pattern, exclude, limit);
-      jsonResponse(res, uris.map(u => u.fsPath));
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(uris.map(u => u.fsPath));
+    } catch (e) { log(`! /files: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/active-editor') {
     const editor = vscode.window.activeTextEditor;
-    if (!editor) { jsonResponse(res, { activeEditor: null }); return; }
+    if (!editor) { respond({ activeEditor: null }); return; }
     const doc = editor.document;
     const sel = editor.selection;
-    jsonResponse(res, {
+    respond({
       activeEditor: {
         file: doc.uri.fsPath,
         language: doc.languageId,
@@ -335,14 +369,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const rows = file
         ? vscode.languages.getDiagnostics(vscode.Uri.file(file)).filter(d => d.severity <= maxSev).map(d => toRow(file, d))
         : vscode.languages.getDiagnostics().flatMap(([uri, ds]) => ds.filter(d => d.severity <= maxSev).map(d => toRow(uri.fsPath, d)));
-      jsonResponse(res, rows);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(rows);
+    } catch (e) { log(`! /diagnostics: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/definition') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     try {
@@ -354,14 +388,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         const { uri, range } = 'targetUri' in l ? { uri: l.targetUri, range: l.targetRange } : l;
         return { file: uri.fsPath, startLine: range.start.line + 1, startCol: range.start.character + 1 };
       });
-      jsonResponse(res, locs);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(locs);
+    } catch (e) { log(`! /definition: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/references') {
     const file  = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line  = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col   = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     const limit = parseInt(url.searchParams.get('limit') ?? String(cfg<number>('maxReferences') || 200), 10);
@@ -371,14 +405,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         8000, 'Reference query timed out'
       );
       const locs = (raw ?? []).slice(0, limit).map(l => ({ file: l.uri.fsPath, line: l.range.start.line + 1, col: l.range.start.character + 1 }));
-      jsonResponse(res, locs);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(locs);
+    } catch (e) { log(`! /references: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/call-hierarchy') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line      = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col       = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     const direction = url.searchParams.get('direction') ?? 'incoming';
@@ -388,7 +422,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         vscode.commands.executeCommand<vscode.CallHierarchyItem[]>('vscode.prepareCallHierarchy', vscode.Uri.file(file), new vscode.Position(line, col)),
         8000, 'Call hierarchy prepare timed out'
       );
-      if (!items?.length) { jsonResponse(res, []); return; }
+      if (!items?.length) { respond([]); return; }
       const cmd   = direction === 'outgoing' ? 'vscode.provideOutgoingCalls' : 'vscode.provideIncomingCalls';
       const calls = await withTimeout(
         vscode.commands.executeCommand<(vscode.CallHierarchyIncomingCall | vscode.CallHierarchyOutgoingCall)[]>(cmd, items[0]),
@@ -398,15 +432,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         const sym = direction === 'outgoing' ? (c as vscode.CallHierarchyOutgoingCall).to : (c as vscode.CallHierarchyIncomingCall).from;
         return { name: sym.name, kind: vscode.SymbolKind[sym.kind] ?? String(sym.kind), file: sym.uri.fsPath, line: sym.selectionRange.start.line + 1, col: sym.selectionRange.start.character + 1, callSites: c.fromRanges.length };
       });
-      jsonResponse(res, rows);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(rows);
+    } catch (e) { log(`! /call-hierarchy: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/git-status') {
     try {
       const gitExt = vscode.extensions.getExtension('vscode.git');
-      if (!gitExt) { jsonResponse(res, { error: 'Git extension not found' }, 404); return; }
+      if (!gitExt) { respond({ error: 'Git extension not found' }, 404); return; }
       if (!gitExt.isActive) await gitExt.activate();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const api = (gitExt.exports as any).getAPI(1);
@@ -418,21 +452,21 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         const head = repo.state.HEAD;
         return { root: repo.rootUri.fsPath, branch: head?.name ?? null, commit: head?.commit?.slice(0, 8) ?? null, ahead: head?.ahead ?? 0, behind: head?.behind ?? 0, staged: repo.state.indexChanges.map(mapChange), unstaged: repo.state.workingTreeChanges.map(mapChange), untracked: (repo.state.untrackedChanges ?? []).map(mapChange) };
       });
-      jsonResponse(res, repos);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(repos);
+    } catch (e) { log(`! /git-status: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/search') {
     const q          = url.searchParams.get('q');
-    if (!q) { jsonResponse(res, { error: 'q param required' }, 400); return; }
+    if (!q) { respond({ error: 'q param required' }, 400); return; }
     const include    = url.searchParams.get('include');
     const exclude    = url.searchParams.get('exclude');
     const maxResults = Math.min(parseInt(url.searchParams.get('maxResults') ?? '100', 10), cfg<number>('maxSearchResults') || 500);
     const isRegex    = url.searchParams.get('regex') === '1';
 
     const folders = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
-    if (!folders.length) { jsonResponse(res, []); return; }
+    if (!folders.length) { respond([]); return; }
 
     const appRoot   = vscode.env.appRoot;
     const bundledRg = path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', 'rg');
@@ -463,14 +497,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           resolve(rows);
         });
       });
-      jsonResponse(res, results);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(results);
+    } catch (e) { log(`! /search: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/type-definition') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     try {
@@ -482,14 +516,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         const { uri, range } = 'targetUri' in l ? { uri: l.targetUri, range: l.targetRange } : l;
         return { file: uri.fsPath, startLine: range.start.line + 1, startCol: range.start.character + 1 };
       });
-      jsonResponse(res, locs);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(locs);
+    } catch (e) { log(`! /type-definition: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/implementation') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     try {
@@ -501,14 +535,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         const { uri, range } = 'targetUri' in l ? { uri: l.targetUri, range: l.targetRange } : l;
         return { file: uri.fsPath, startLine: range.start.line + 1, startCol: range.start.character + 1 };
       });
-      jsonResponse(res, locs);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(locs);
+    } catch (e) { log(`! /implementation: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/declaration') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     try {
@@ -520,14 +554,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         const { uri, range } = 'targetUri' in l ? { uri: l.targetUri, range: l.targetRange } : l;
         return { file: uri.fsPath, startLine: range.start.line + 1, startCol: range.start.character + 1 };
       });
-      jsonResponse(res, locs);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(locs);
+    } catch (e) { log(`! /declaration: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/signature-help') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     try {
@@ -535,7 +569,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         vscode.commands.executeCommand<vscode.SignatureHelp>('vscode.executeSignatureHelpProvider', vscode.Uri.file(file), new vscode.Position(line, col)),
         8000, 'Signature help timed out'
       );
-      if (!raw) { jsonResponse(res, null); return; }
+      if (!raw) { respond(null); return; }
       const result = {
         signatures: raw.signatures.map(sig => ({
           label: sig.label,
@@ -548,14 +582,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         activeSignature: raw.activeSignature ?? 0,
         activeParameter: raw.activeParameter ?? 0,
       };
-      jsonResponse(res, result);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(result);
+    } catch (e) { log(`! /signature-help: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/completion') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line  = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col   = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10), 200);
@@ -572,14 +606,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         insertText: typeof d.insertText === 'string' ? d.insertText : (d.insertText as vscode.SnippetString | undefined)?.value ?? (typeof d.label === 'string' ? d.label : (d.label as vscode.CompletionItemLabel).label),
         sortText: d.sortText ?? '',
       }));
-      jsonResponse(res, items);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(items);
+    } catch (e) { log(`! /completion: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/inlay-hints') {
     const file      = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const startLine = Math.max(0, parseInt(url.searchParams.get('startLine') ?? '1', 10) - 1);
     const endLine   = Math.max(0, parseInt(url.searchParams.get('endLine')   ?? '1', 10) - 1);
     try {
@@ -596,14 +630,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         paddingLeft: h.paddingLeft ?? false,
         paddingRight: h.paddingRight ?? false,
       }));
-      jsonResponse(res, hints);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(hints);
+    } catch (e) { log(`! /inlay-hints: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/document-highlights') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const line = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col  = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     try {
@@ -618,16 +652,16 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         endCol: h.range.end.character + 1,
         kind: vscode.DocumentHighlightKind[h.kind ?? vscode.DocumentHighlightKind.Text] ?? String(h.kind),
       }));
-      jsonResponse(res, highlights);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(highlights);
+    } catch (e) { log(`! /document-highlights: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/rename') {
     const file    = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const newName = url.searchParams.get('newName');
-    if (!newName) { jsonResponse(res, { error: 'newName param required' }, 400); return; }
+    if (!newName) { respond({ error: 'newName param required' }, 400); return; }
     const line  = Math.max(0, parseInt(url.searchParams.get('line') ?? '1', 10) - 1);
     const col   = Math.max(0, parseInt(url.searchParams.get('col')  ?? '1', 10) - 1);
     const apply = url.searchParams.get('apply') === '1' || url.searchParams.get('apply') === 'true';
@@ -635,7 +669,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // Pre-open AND warm the language server by triggering documentSymbolProvider,
     // which forces the TS/Python/etc. server to attach to the document before rename runs.
     try { await vscode.workspace.openTextDocument(vscode.Uri.file(file)); }
-    catch (e) { jsonResponse(res, { error: `openTextDocument: ${String(e)}` }, 500); return; }
+    catch (e) { log(`! /rename openTextDocument: ${String(e)}`); respond({ error: `openTextDocument: ${translateError(e)}`, rawError: String(e) }, 500); return; }
     try { await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', vscode.Uri.file(file)); }
     catch { /* warming is best-effort */ }
     let edit: vscode.WorkspaceEdit | undefined;
@@ -646,15 +680,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           vscode.commands.executeCommand<vscode.WorkspaceEdit>('vscode.executeDocumentRenameProvider', vscode.Uri.file(file), new vscode.Position(line, col), newName),
           8000, 'Rename timed out'
         );
-      } catch (e) { jsonResponse(res, { error: `executeCommand: ${String(e)}` }, 500); return; }
+      } catch (e) { log(`! /rename executeCommand: ${String(e)}`); respond({ error: `executeCommand: ${translateError(e)}`, rawError: String(e) }, 500); return; }
       if (edit && edit.size > 0) break;
       if (attempt < 2) await new Promise(r => setTimeout(r, 300));
     }
-    if (!edit) { jsonResponse(res, { preview: [], applied: false }); return; }
+    if (!edit) { respond({ preview: [], applied: false }); return; }
     const preview: { file: string; edits: { startLine: number; startCol: number; endLine: number; endCol: number; newText: string }[] }[] = [];
     let entries: ReadonlyArray<[vscode.Uri, vscode.TextEdit[]]>;
     try { entries = edit.entries(); }
-    catch (e) { jsonResponse(res, { error: `edit.entries(): ${String(e)}` }, 500); return; }
+    catch (e) { log(`! /rename edit.entries(): ${String(e)}`); respond({ error: `edit.entries(): ${translateError(e)}`, rawError: String(e) }, 500); return; }
     for (let i = 0; i < entries.length; i++) {
       try {
         const [uri, textEdits] = entries[i];
@@ -673,14 +707,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           }),
         });
       } catch (e) {
-        jsonResponse(res, { error: `entry[${i}]: ${String(e)}`, preview }, 500);
+        log(`! /rename entry[${i}]: ${String(e)}`);
+        respond({ error: `entry[${i}]: ${translateError(e)}`, rawError: String(e), preview }, 500);
         return;
       }
     }
-    if (!apply) { jsonResponse(res, { preview, applied: false }); return; }
+    if (!apply) { respond({ preview, applied: false }); return; }
     let applied = false;
     try { applied = await vscode.workspace.applyEdit(edit); }
-    catch (e) { jsonResponse(res, { error: `applyEdit: ${String(e)}`, preview }, 500); return; }
+    catch (e) { log(`! /rename applyEdit: ${String(e)}`); respond({ error: `applyEdit: ${translateError(e)}`, rawError: String(e), preview }, 500); return; }
     // applyEdit modifies in-memory documents but doesn't save. Persist them.
     let saved = 0;
     if (applied) {
@@ -691,13 +726,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         } catch { /* skip individual save failures */ }
       }
     }
-    jsonResponse(res, { preview, applied, saved });
+    respond({ preview, applied, saved });
     return;
   }
 
   if (url.pathname === '/code-actions') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const startLine = Math.max(0, parseInt(url.searchParams.get('startLine') ?? '1', 10) - 1);
     const startCol  = Math.max(0, parseInt(url.searchParams.get('startCol')  ?? '1', 10) - 1);
     const endLine   = Math.max(0, parseInt(url.searchParams.get('endLine')   ?? url.searchParams.get('startLine') ?? '1', 10) - 1);
@@ -723,21 +758,21 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           index,
         };
       });
-      jsonResponse(res, actions);
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond(actions);
+    } catch (e) { log(`! /code-actions: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
   if (url.pathname === '/apply-code-action') {
     const file = url.searchParams.get('file');
-    if (!file) { jsonResponse(res, { error: 'file param required' }, 400); return; }
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
     const startLine  = Math.max(0, parseInt(url.searchParams.get('startLine') ?? '1', 10) - 1);
     const startCol   = Math.max(0, parseInt(url.searchParams.get('startCol')  ?? '1', 10) - 1);
     const endLine    = Math.max(0, parseInt(url.searchParams.get('endLine')   ?? url.searchParams.get('startLine') ?? '1', 10) - 1);
     const endCol     = Math.max(0, parseInt(url.searchParams.get('endCol')    ?? url.searchParams.get('startCol')  ?? '1', 10) - 1);
     const kindFilter = url.searchParams.get('kindFilter');
     const actionIndexStr = url.searchParams.get('actionIndex');
-    if (actionIndexStr === null) { jsonResponse(res, { error: 'actionIndex param required' }, 400); return; }
+    if (actionIndexStr === null) { respond({ error: 'actionIndex param required' }, 400); return; }
     const actionIndex = parseInt(actionIndexStr, 10);
     try {
       const range = new vscode.Range(new vscode.Position(startLine, startCol), new vscode.Position(endLine, endCol));
@@ -748,7 +783,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       );
       const actions = raw ?? [];
       if (actionIndex < 0 || actionIndex >= actions.length) {
-        jsonResponse(res, { applied: false, title: '' });
+        respond({ applied: false, title: '' });
         return;
       }
       const action = actions[actionIndex];
@@ -762,12 +797,144 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         await vscode.commands.executeCommand(ca.command.command, ...(ca.command.arguments ?? []));
         applied = true;
       }
-      jsonResponse(res, { applied, title });
-    } catch (e) { jsonResponse(res, { error: String(e) }, 500); }
+      respond({ applied, title });
+    } catch (e) { log(`! /apply-code-action: ${String(e)}`); respond({ error: translateError(e) }, 500); }
     return;
   }
 
-  jsonResponse(res, { error: 'Not found' }, 404);
+  // ── Tier C: format, format-range, organize-imports, fix-all ─────────────────
+
+  if (url.pathname === '/format' || url.pathname === '/format-range') {
+    const file  = url.searchParams.get('file');
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
+    const apply = url.searchParams.get('apply') === '1' || url.searchParams.get('apply') === 'true';
+    const uri   = vscode.Uri.file(file);
+    try {
+      await vscode.workspace.openTextDocument(uri);
+    } catch (e) { log(`! ${url.pathname} openTextDocument: ${String(e)}`); respond({ error: `openTextDocument: ${translateError(e)}`, rawError: String(e) }, 500); return; }
+    try {
+      const options = { tabSize: 2, insertSpaces: true };
+      let textEdits: vscode.TextEdit[] | undefined;
+      if (url.pathname === '/format-range') {
+        const sl = Math.max(0, parseInt(url.searchParams.get('startLine') ?? '1', 10) - 1);
+        const sc = Math.max(0, parseInt(url.searchParams.get('startCol')  ?? '1', 10) - 1);
+        const el = Math.max(0, parseInt(url.searchParams.get('endLine')   ?? url.searchParams.get('startLine') ?? '1', 10) - 1);
+        const ec = Math.max(0, parseInt(url.searchParams.get('endCol')    ?? url.searchParams.get('startCol')  ?? '1', 10) - 1);
+        const range = new vscode.Range(new vscode.Position(sl, sc), new vscode.Position(el, ec));
+        textEdits = await withTimeout(
+          vscode.commands.executeCommand<vscode.TextEdit[]>('vscode.executeFormatRangeProvider', uri, range, options),
+          8000, 'Format range timed out'
+        );
+      } else {
+        textEdits = await withTimeout(
+          vscode.commands.executeCommand<vscode.TextEdit[]>('vscode.executeFormatDocumentProvider', uri, options),
+          8000, 'Format document timed out'
+        );
+      }
+      const edits = (textEdits ?? []).map(te => ({
+        startLine: te.range.start.line + 1,
+        startCol:  te.range.start.character + 1,
+        endLine:   te.range.end.line + 1,
+        endCol:    te.range.end.character + 1,
+        newText:   te.newText,
+      }));
+      const preview = [{ file, edits }];
+      if (!apply || edits.length === 0) { respond({ preview, applied: false, saved: 0 }); return; }
+      const wsEdit = new vscode.WorkspaceEdit();
+      for (const te of textEdits ?? []) wsEdit.replace(uri, te.range, te.newText);
+      const applied = await vscode.workspace.applyEdit(wsEdit);
+      let saved = 0;
+      if (applied) {
+        try {
+          const doc = await vscode.workspace.openTextDocument(uri);
+          if (doc.isDirty && await doc.save()) saved = 1;
+        } catch { /* ignore */ }
+      }
+      respond({ preview, applied, saved });
+    } catch (e) { log(`! ${url.pathname}: ${String(e)}`); respond({ error: translateError(e), rawError: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/organize-imports') {
+    const file  = url.searchParams.get('file');
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
+    const apply = url.searchParams.get('apply') === '1' || url.searchParams.get('apply') === 'true';
+    const uri   = vscode.Uri.file(file);
+    try {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const fullRange = new vscode.Range(new vscode.Position(0, 0), new vscode.Position(doc.lineCount - 1, Number.MAX_SAFE_INTEGER));
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<(vscode.Command | vscode.CodeAction)[]>('vscode.executeCodeActionProvider', uri, fullRange, 'source.organizeImports'),
+        8000, 'Organize imports timed out'
+      );
+      const actions = (raw ?? []) as vscode.CodeAction[];
+      if (!actions.length) { respond({ preview: [], applied: false, saved: 0, commandOnly: false }); return; }
+      const first = actions[0];
+      if (!first.edit && first.command) {
+        if (apply) {
+          await vscode.commands.executeCommand(first.command.command, ...(first.command.arguments ?? []));
+          let saved = 0;
+          try { const d = await vscode.workspace.openTextDocument(uri); if (d.isDirty && await d.save()) saved = 1; } catch { /* ignore */ }
+          respond({ preview: [], applied: true, saved, commandOnly: true });
+        } else {
+          respond({ preview: [], applied: false, saved: 0, commandOnly: true });
+        }
+        return;
+      }
+      const preview = first.edit ? (() => {
+        const out: { file: string; edits: object[] }[] = [];
+        for (const [u, tes] of first.edit.entries()) {
+          out.push({ file: (u as { fsPath: string }).fsPath, edits: tes.map(te => ({ startLine: te.range.start.line + 1, startCol: te.range.start.character + 1, endLine: te.range.end.line + 1, endCol: te.range.end.character + 1, newText: te.newText })) });
+        }
+        return out;
+      })() : [];
+      if (!apply) { respond({ preview, applied: false, saved: 0, commandOnly: false }); return; }
+      let applied = false;
+      if (first.edit) applied = await vscode.workspace.applyEdit(first.edit);
+      if (first.command) { await vscode.commands.executeCommand(first.command.command, ...(first.command.arguments ?? [])); applied = true; }
+      let saved = 0;
+      if (applied) { try { const d = await vscode.workspace.openTextDocument(uri); if (d.isDirty && await d.save()) saved = 1; } catch { /* ignore */ } }
+      respond({ preview, applied, saved, commandOnly: false });
+    } catch (e) { log(`! /organize-imports: ${String(e)}`); respond({ error: translateError(e), rawError: String(e) }, 500); }
+    return;
+  }
+
+  if (url.pathname === '/fix-all') {
+    const file  = url.searchParams.get('file');
+    if (!file) { respond({ error: 'file param required' }, 400); return; }
+    const apply = url.searchParams.get('apply') === '1' || url.searchParams.get('apply') === 'true';
+    const uri   = vscode.Uri.file(file);
+    try {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const fullRange = new vscode.Range(new vscode.Position(0, 0), new vscode.Position(doc.lineCount - 1, Number.MAX_SAFE_INTEGER));
+      const raw = await withTimeout(
+        vscode.commands.executeCommand<(vscode.Command | vscode.CodeAction)[]>('vscode.executeCodeActionProvider', uri, fullRange, 'source.fixAll'),
+        8000, 'Fix all timed out'
+      );
+      const actions = (raw ?? []) as vscode.CodeAction[];
+      if (!actions.length) { respond({ preview: [], applied: 0, saved: 0 }); return; }
+      const allPreview: { file: string; edits: object[] }[] = [];
+      let appliedCount = 0;
+      for (const action of actions) {
+        if (action.edit) {
+          for (const [u, tes] of action.edit.entries()) {
+            allPreview.push({ file: (u as { fsPath: string }).fsPath, edits: tes.map(te => ({ startLine: te.range.start.line + 1, startCol: te.range.start.character + 1, endLine: te.range.end.line + 1, endCol: te.range.end.character + 1, newText: te.newText })) });
+          }
+        }
+      }
+      if (!apply) { respond({ preview: allPreview, applied: 0, saved: 0 }); return; }
+      for (const action of actions) {
+        if (action.edit) { if (await vscode.workspace.applyEdit(action.edit)) appliedCount++; }
+        if (action.command) { await vscode.commands.executeCommand(action.command.command, ...(action.command.arguments ?? [])); appliedCount++; }
+      }
+      let saved = 0;
+      if (appliedCount > 0) { try { const d = await vscode.workspace.openTextDocument(uri); if (d.isDirty && await d.save()) saved = 1; } catch { /* ignore */ } }
+      respond({ preview: allPreview, applied: appliedCount, saved });
+    } catch (e) { log(`! /fix-all: ${String(e)}`); respond({ error: translateError(e), rawError: String(e) }, 500); }
+    return;
+  }
+
+  respond({ error: 'Not found' }, 404);
 }
 
 // ─── Chat participant ─────────────────────────────────────────────────────────
@@ -866,6 +1033,11 @@ async function promptSetup(): Promise<void> {
 // ─── Activation ───────────────────────────────────────────────────────────────
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Output channel — create BEFORE anything else so log() works from the start
+  output = vscode.window.createOutputChannel('Claude Code Workspace');
+  context.subscriptions.push(output);
+  log(`Activating extension v${VERSION}`);
+
   // Status bar
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.text = '$(loading~spin) Claude Bridge';
@@ -929,4 +1101,5 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export function deactivate(): void {
   bridgeServer?.close();
   statusBar?.dispose();
+  output?.dispose();
 }

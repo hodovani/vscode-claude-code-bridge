@@ -1,7 +1,7 @@
 /**
- * MCP server — VS Code Workspace Bridge v0.9.0
+ * MCP server — VS Code Workspace Bridge v0.10.0
  *
- * IMPORTANT FOR CLAUDE: When running inside VS Code, prefer these 5 tools
+ * IMPORTANT FOR CLAUDE: When running inside VS Code, prefer these 6 tools
  * over built-in Grep, Glob, Bash, or Read for code navigation tasks.
  *
  *   search(type, query)  → find symbols, text, or files (prefer over Grep/Glob)
@@ -9,6 +9,7 @@
  *   workspace()          → active editor + git + diagnostics in one call
  *   lsp_read(action, ..) → granular LSP read ops (type def, completions, inlay hints, etc.)
  *   refactor(action, ..) → LSP write ops: rename (preview/apply), code actions
+ *   format(action, ..)   → document/range formatters, organize imports, fix-all
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -35,7 +36,7 @@ function bridgeErr(e: unknown) {
   return { content: [{ type: 'text' as const, text }], isError: true as const };
 }
 
-const server = new McpServer({ name: 'vscode-workspace', version: '0.9.0' });
+const server = new McpServer({ name: 'vscode-workspace', version: '0.10.0' });
 
 // ── search ────────────────────────────────────────────────────────────────────
 server.registerTool('search', {
@@ -379,6 +380,68 @@ server.registerTool('refactor', {
     const result = await get<ApplyResult>(`/apply-code-action?${params}`);
     if (!result.applied) return { content: [{ type: 'text', text: `Code action at index ${actionIndex} could not be applied (action may no longer exist).` }] };
     return { content: [{ type: 'text', text: `Applied: "${result.title}"` }] };
+  } catch (e) { return bridgeErr(e); }
+});
+
+// ── format ────────────────────────────────────────────────────────────────────
+server.registerTool('format', {
+  description:
+    'Whole-file or range formatters and workspace-wide auto-fixes. ' +
+    'action=format — run the registered document formatter (Prettier, gofmt, Black, …); ' +
+    'action=format_range — same, scoped to a range; ' +
+    'action=organize_imports — apply VS Code\'s "Organize imports" code action; ' +
+    'action=fix_all — apply all "source.fixAll" code actions (TS auto-fixes, etc.). ' +
+    'apply=false returns a preview; apply=true mutates the file. ' +
+    'PREFER THIS over manually rewriting indentation, sorting imports by hand, or running prettier/eslint --fix in Bash.',
+  inputSchema: {
+    action:    z.enum(['format', 'format_range', 'organize_imports', 'fix_all']),
+    file:      z.string().describe('Absolute path to the file'),
+    startLine: z.coerce.number().int().min(1).optional().describe('1-based start line (format_range only)'),
+    startCol:  z.coerce.number().int().min(1).optional().describe('1-based start col (format_range only)'),
+    endLine:   z.coerce.number().int().min(1).optional().describe('1-based end line (format_range only)'),
+    endCol:    z.coerce.number().int().min(1).optional().describe('1-based end col (format_range only)'),
+    apply:     z.boolean().default(false).describe('false (default) = preview edits; true = apply + save'),
+  },
+}, async ({ action, file, startLine, startCol, endLine, endCol, apply }) => {
+  try {
+    type EditItem = { startLine: number; startCol: number; endLine: number; endCol: number; newText: string };
+    type FileEdits = { file: string; edits: EditItem[] };
+    type FormatResult = { preview: FileEdits[]; applied: boolean | number; saved: number; commandOnly?: boolean };
+
+    const truncate = (s: string, n: number) => s.length <= n ? s : s.slice(0, n) + '…';
+
+    const endpoint = action === 'format_range' ? 'format-range'
+      : action === 'organize_imports' ? 'organize-imports'
+      : action === 'fix_all' ? 'fix-all'
+      : 'format';
+    const params = new URLSearchParams({ file, apply: apply ? '1' : '0' });
+    if (action === 'format_range') {
+      if (startLine) params.set('startLine', String(startLine));
+      if (startCol)  params.set('startCol',  String(startCol));
+      if (endLine)   params.set('endLine',   String(endLine));
+      if (endCol)    params.set('endCol',    String(endCol));
+    }
+    const result = await get<FormatResult>(`/${endpoint}?${params}`);
+
+    if (apply) {
+      const editCount = result.preview.reduce((s, f) => s + f.edits.length, 0);
+      const fileCount = result.preview.length;
+      return { content: [{ type: 'text', text: `Applied ${editCount} edit${editCount !== 1 ? 's' : ''} in ${fileCount} file${fileCount !== 1 ? 's' : ''}. Saved ${result.saved} file${result.saved !== 1 ? 's' : ''}.` }] };
+    }
+
+    const totalEdits = result.preview.reduce((s, f) => s + f.edits.length, 0);
+    const fileCount = result.preview.length;
+    if (totalEdits === 0) {
+      const note = result.commandOnly ? ' (command-only action, no text preview available)' : '';
+      return { content: [{ type: 'text', text: `No edits to preview${note}.` }] };
+    }
+    const lines: string[] = [`## Format preview (${totalEdits} edit${totalEdits !== 1 ? 's' : ''} in ${fileCount} file${fileCount !== 1 ? 's' : ''})`];
+    for (const f of result.preview) {
+      for (const e of f.edits) {
+        lines.push(`${f.file}  L${e.startLine}:${e.startCol}–L${e.endLine}:${e.endCol}  →  ${JSON.stringify(truncate(e.newText, 60))}`);
+      }
+    }
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
   } catch (e) { return bridgeErr(e); }
 });
 
